@@ -16,6 +16,7 @@ limitations under the License.
 package cosign
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/ecdsa"
@@ -41,6 +42,7 @@ import (
 	"github.com/sigstore/sigstore-go/pkg/root"
 	"github.com/sigstore/sigstore-go/pkg/tuf"
 	"github.com/sigstore/sigstore-go/pkg/verify"
+	sigstoreSignature "github.com/sigstore/sigstore/pkg/signature"
 )
 
 // Mock store for testing
@@ -501,6 +503,85 @@ func TestGetBundleMsgSignature(t *testing.T) {
 				if result == nil {
 					t.Errorf("Expected result but got nil")
 				}
+			}
+		})
+	}
+}
+
+func TestValidateSignatureLayerPayload(t *testing.T) {
+	subjectDesc := ocispec.Descriptor{
+		Digest: digest.FromString("subject-manifest"),
+	}
+	validPayload := []byte(fmt.Sprintf(`{"critical":{"image":{"docker-manifest-digest":%q}}}`, subjectDesc.Digest.String()))
+	mismatchedClaimPayload := []byte(`{"critical":{"image":{"docker-manifest-digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}`)
+
+	tests := []struct {
+		name        string
+		layer       ocispec.Descriptor
+		payload     []byte
+		subject     ocispec.Descriptor
+		expectedErr string
+	}{
+		{
+			name: "valid simple signing payload",
+			layer: ocispec.Descriptor{
+				Digest: digest.FromBytes(validPayload),
+			},
+			payload: validPayload,
+			subject: subjectDesc,
+		},
+		{
+			name: "payload digest mismatch",
+			layer: ocispec.Descriptor{
+				Digest: digest.FromString("different-payload"),
+			},
+			payload:     validPayload,
+			subject:     subjectDesc,
+			expectedErr: "signature payload digest mismatch",
+		},
+		{
+			name: "claim digest mismatch",
+			layer: ocispec.Descriptor{
+				Digest: digest.FromBytes(mismatchedClaimPayload),
+			},
+			payload:     mismatchedClaimPayload,
+			subject:     subjectDesc,
+			expectedErr: "invalid or missing digest in claim",
+		},
+		{
+			name: "malformed simple signing payload",
+			layer: ocispec.Descriptor{
+				Digest: digest.FromBytes([]byte("not-json")),
+			},
+			payload:     []byte("not-json"),
+			subject:     subjectDesc,
+			expectedErr: "failed to unmarshal cosign simple signing payload",
+		},
+		{
+			name: "missing subject digest",
+			layer: ocispec.Descriptor{
+				Digest: digest.FromBytes(validPayload),
+			},
+			payload:     validPayload,
+			subject:     ocispec.Descriptor{},
+			expectedErr: "subject digest is required",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateSignatureLayerPayload(tt.layer, tt.payload, tt.subject)
+			if tt.expectedErr == "" {
+				if err != nil {
+					t.Fatalf("Unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Expected error containing %q but got none", tt.expectedErr)
+			}
+			if !strings.Contains(err.Error(), tt.expectedErr) {
+				t.Fatalf("Expected error containing %q but got %q", tt.expectedErr, err.Error())
 			}
 		})
 	}
@@ -1095,6 +1176,84 @@ func TestVerifier_VerifyWithSignatureLayers(t *testing.T) {
 		}
 	} else {
 		t.Errorf("Expected verification details but got nil")
+	}
+}
+
+func TestVerifier_VerifyWithValidKeySignature(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStore()
+	repo := "test/repo"
+
+	privateKey, publicKey, err := generateTestKey()
+	if err != nil {
+		t.Fatalf("Failed to generate test key: %v", err)
+	}
+	signer, err := sigstoreSignature.LoadSigner(privateKey, crypto.SHA256)
+	if err != nil {
+		t.Fatalf("Failed to load signer: %v", err)
+	}
+
+	subjectDesc := ocispec.Descriptor{
+		MediaType: ocispec.MediaTypeImageManifest,
+		Digest:    digest.FromString("subject-manifest"),
+		Size:      100,
+	}
+	payload := []byte(fmt.Sprintf(`{"critical":{"image":{"docker-manifest-digest":%q}}}`, subjectDesc.Digest.String()))
+	signatureBytes, err := signer.SignMessage(bytes.NewReader(payload))
+	if err != nil {
+		t.Fatalf("Failed to sign payload: %v", err)
+	}
+	sigLayer := ocispec.Descriptor{
+		MediaType: mediaTypeSimpleSigning,
+		Digest:    digest.FromBytes(payload),
+		Size:      int64(len(payload)),
+		Annotations: map[string]string{
+			annotationKeySignature: base64.StdEncoding.EncodeToString(signatureBytes),
+		},
+	}
+	manifestBytes, err := createTestManifest([]ocispec.Descriptor{sigLayer})
+	if err != nil {
+		t.Fatalf("Failed to create test manifest: %v", err)
+	}
+	artifactDesc := ocispec.Descriptor{
+		ArtifactType: mediaTypeCosignArtifactSignature,
+		MediaType:    ocispec.MediaTypeImageManifest,
+		Digest:       digest.FromBytes(manifestBytes),
+		Size:         int64(len(manifestBytes)),
+	}
+	store.addManifest(repo, artifactDesc, manifestBytes)
+	store.addBlob(repo, sigLayer, payload)
+
+	verifier, err := NewVerifier(&VerifierOptions{
+		Name:       "test-verifier",
+		IgnoreTLog: true,
+		GetPublicKeys: (&testTrustedPublicKeys{
+			configs: []*PublicKeyConfig{
+				{
+					PublicKey:          publicKey,
+					SignatureAlgorithm: crypto.SHA256,
+				},
+			},
+		}).GetPublicKeys,
+	})
+	if err != nil {
+		t.Fatalf("Failed to create verifier: %v", err)
+	}
+
+	result, err := verifier.Verify(ctx, &ratify.VerifyOptions{
+		Store:              store,
+		Repository:         repo,
+		SubjectDescriptor:  subjectDesc,
+		ArtifactDescriptor: artifactDesc,
+	})
+	if err != nil {
+		t.Fatalf("Unexpected error during verification: %v", err)
+	}
+	if result.Err != nil {
+		t.Fatalf("Expected successful verification but got result error: %v", result.Err)
+	}
+	if result.Description != "Cosign signature verification succeeded" {
+		t.Fatalf("Unexpected description: %s", result.Description)
 	}
 }
 

@@ -37,6 +37,7 @@ import (
 	"github.com/sigstore/sigstore-go/pkg/tuf"
 	"github.com/sigstore/sigstore-go/pkg/verify"
 	"github.com/sigstore/sigstore/pkg/signature"
+	"github.com/sigstore/sigstore/pkg/signature/payload"
 )
 
 const (
@@ -137,10 +138,17 @@ func NewVerifier(opts *VerifierOptions) (*Verifier, error) {
 	return &Verifier{
 		getVerifier:      getVerifier,
 		name:             opts.Name,
-		identityPolicies: opts.IdentityPolicies,
+		identityPolicies: getIdentityPolicies(opts),
 		ignoreTLog:       opts.IgnoreTLog,
 		getPublicKeys:    opts.GetPublicKeys,
 	}, nil
+}
+
+func getIdentityPolicies(opts *VerifierOptions) []verify.PolicyOption {
+	if opts.GetPublicKeys == nil {
+		return opts.IdentityPolicies
+	}
+	return append([]verify.PolicyOption{verify.WithKey()}, opts.IdentityPolicies...)
 }
 
 func createVerifier(opts *VerifierOptions) (*verify.Verifier, error) {
@@ -179,13 +187,13 @@ func createVerifier(opts *VerifierOptions) (*verify.Verifier, error) {
 	// Configure transparency log verification
 	if !opts.IgnoreTLog {
 		verifierOpts = append(verifierOpts, verify.WithTransparencyLog(1))
+		verifierOpts = append(verifierOpts, verify.WithObserverTimestamps(1))
+	} else {
+		verifierOpts = append(verifierOpts, verify.WithCurrentTime())
 	}
 
-	// Configure timestamp verification
-	verifierOpts = append(verifierOpts, verify.WithObserverTimestamps(1))
-
 	// Configure certificate transparency log verification
-	if !opts.IgnoreCTLog {
+	if !opts.IgnoreCTLog && opts.GetPublicKeys == nil {
 		verifierOpts = append(verifierOpts, verify.WithSignedCertificateTimestamps(1))
 	}
 
@@ -259,7 +267,14 @@ func (v *Verifier) Verify(ctx context.Context, opts *ratify.VerifyOptions) (*rat
 		report := &layerReport{
 			Digest: layer.Digest.String(),
 		}
-		if res, err := v.verifySignatureLayer(layer); err != nil {
+		layerPayload, err := opts.Store.FetchBlob(ctx, opts.Repository, layer)
+		if err != nil {
+			report.Error = fmt.Errorf("failed to fetch signature payload: %w", err)
+			report.Succeeded = false
+		} else if err := validateSignatureLayerPayload(layer, layerPayload, opts.SubjectDescriptor); err != nil {
+			report.Error = err
+			report.Succeeded = false
+		} else if res, err := v.verifySignatureLayer(layer); err != nil {
 			report.Error = err
 			report.Succeeded = false
 		} else {
@@ -327,6 +342,36 @@ func (v *Verifier) verifyBundle(bundleObj *bundle.Bundle, layer digest.Digest) (
 		return nil, fmt.Errorf("failed to get verifier: %w", err)
 	}
 	return verifier.Verify(bundleObj, verify.NewPolicy(artifactPolicy, v.identityPolicies...))
+}
+
+func validateSignatureLayerPayload(manifestLayer ocispec.Descriptor, layerPayload []byte, subjectDesc ocispec.Descriptor) error {
+	if err := manifestLayer.Digest.Validate(); err != nil {
+		return fmt.Errorf("invalid signature payload digest: %w", err)
+	}
+	digestVerifier := manifestLayer.Digest.Verifier()
+	if _, err := digestVerifier.Write(layerPayload); err != nil {
+		return fmt.Errorf("failed to hash signature payload: %w", err)
+	}
+	if !digestVerifier.Verified() {
+		return fmt.Errorf("signature payload digest mismatch: expected %s", manifestLayer.Digest)
+	}
+
+	if subjectDesc.Digest == "" {
+		return fmt.Errorf("subject digest is required for cosign claims verification")
+	}
+	if err := subjectDesc.Digest.Validate(); err != nil {
+		return fmt.Errorf("invalid subject digest: %w", err)
+	}
+
+	var simpleSigningPayload payload.SimpleContainerImage
+	if err := json.Unmarshal(layerPayload, &simpleSigningPayload); err != nil {
+		return fmt.Errorf("failed to unmarshal cosign simple signing payload: %w", err)
+	}
+	foundDigest := simpleSigningPayload.Critical.Image.DockerManifestDigest
+	if foundDigest != subjectDesc.Digest.String() {
+		return fmt.Errorf("invalid or missing digest in claim: %s", foundDigest)
+	}
+	return nil
 }
 
 // getBundleVerificationMaterial returns the bundle verification material from
