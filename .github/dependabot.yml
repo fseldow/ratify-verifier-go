@@ -16,6 +16,7 @@ updates:
   - package-ecosystem: "gomod"
     directories:
       - "/notation"
+      - "/schemavalidator"
     schedule:
       interval: "weekly"
   - package-ecosystem: "github-actions"
